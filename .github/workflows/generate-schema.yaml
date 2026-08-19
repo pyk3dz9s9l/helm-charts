@@ -1,275 +1,186 @@
-name: "Generate values.schema.json"
-
-on:
-  pull_request_target:
-    types:
-      - opened
-      - reopened
-    paths:
-      - "charts/**/values.yaml"
-  workflow_dispatch:
-    inputs:
-      charts:
-        description: 'Specific charts to generate schema for (comma-separated, e.g., "nginx,redis"). Leave empty for all charts.'
-        required: false
-        type: string
-      force_regenerate:
-        description: "Force regeneration even if values.yaml has not changed"
-        required: false
-        type: boolean
-        default: false
-
+name: Generate values.schema.json
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
-
-permissions: # added using https://github.com/step-security/secure-repo
-  contents: read
-
 jobs:
-  authorize:
-    runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'pull_request_target' &&
-      github.event.pull_request.head.repo.full_name != github.repository &&
-      'external' || '' }}
-    steps:
-      - run: "true"
   generate-schema:
-    needs: authorize
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Skip if the commit was made by github-actions bot to prevent infinite loops
     if: github.actor != 'github-actions[bot]'
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # For pull_request_target, we need to explicitly checkout the PR head
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
-          fetch-depth: 0
-          token: ${{ github.token }}
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
+        fetch-depth: 0
+        token: ${{ secrets.CHANGELOG_PAT }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.11'
+    - name: Set up Helm
+      uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
+      with:
+        version: v3.19.2
+    - name: Install helm-schema plugin
+      run: |
+        set -e
+        # Check if plugin is already installed
+        if helm plugin list | grep -q "schema"; then
+          echo "Plugin already installed"
+          helm plugin list | grep "schema"
+        else
+          echo "Installing helm-values-schema-json plugin..."
+          helm plugin install https://github.com/losisin/helm-values-schema-json.git --version v2.3.1
+        fi
 
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.11"
+        # Verify plugin installation
+        echo "Verifying plugin installation..."
+        helm plugin list
+        if ! helm plugin list | grep -q "schema"; then
+          echo "ERROR: Plugin installation failed"
+          exit 1
+        fi
 
-      - name: Set up Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
-        with:
-          version: "v3.19.2"
+        echo "Plugin installed successfully"
+    - name: Determine charts to process
+      id: determine-charts
+      run: |
+        set -e
 
-      - name: Install helm-schema plugin
-        run: |
-          set -e
-          # Check if plugin is already installed
-          if helm plugin list | grep -q "schema"; then
-            echo "Plugin already installed"
-            helm plugin list | grep "schema"
+        # Function to get all charts except 'common'
+        get_all_charts() {
+          find charts -mindepth 1 -maxdepth 1 -type d ! -name 'common' -exec basename {} \; | sort
+        }
+
+        # For workflow_dispatch with specific charts
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.charts }}" ]; then
+          echo "Manual trigger with specific charts: ${{ github.event.inputs.charts }}"
+          CHARTS="${{ github.event.inputs.charts }}"
+          echo "charts=$CHARTS" >> $GITHUB_OUTPUT
+          echo "mode=manual-specific" >> $GITHUB_OUTPUT
+
+        # For workflow_dispatch with force regenerate all
+        elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_regenerate }}" = "true" ]; then
+          echo "Manual trigger: force regenerate all charts"
+          CHARTS=$(get_all_charts | tr '\n' ',' | sed 's/,$//')
+          echo "charts=$CHARTS" >> $GITHUB_OUTPUT
+          echo "mode=manual-all" >> $GITHUB_OUTPUT
+
+        # For PR events - detect changed charts
+        else
+          echo "Detecting changed charts from git diff"
+          BASE_REF="${{ github.event.pull_request.base.sha }}"
+
+          # Get changed values.yaml files
+          CHANGED_FILES=$(git diff --name-only "$BASE_REF" HEAD -- 'charts/**/values.yaml' || echo "")
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No values.yaml files changed"
+            echo "charts=" >> $GITHUB_OUTPUT
+            echo "mode=none" >> $GITHUB_OUTPUT
           else
-            echo "Installing helm-values-schema-json plugin..."
-            helm plugin install https://github.com/losisin/helm-values-schema-json.git --version v2.3.1
-          fi
+            echo "Changed values.yaml files:"
+            echo "$CHANGED_FILES"
 
-          # Verify plugin installation
-          echo "Verifying plugin installation..."
-          helm plugin list
-          if ! helm plugin list | grep -q "schema"; then
-            echo "ERROR: Plugin installation failed"
-            exit 1
-          fi
+            # Extract chart names from changed files
+            CHARTS=$(echo "$CHANGED_FILES" | grep -o 'charts/[^/]*' | cut -d/ -f2 | sort -u | grep -v '^common$' | tr '\n' ',' | sed 's/,$//')
 
-          echo "Plugin installed successfully"
-
-      - name: Determine charts to process
-        id: determine-charts
-        run: |
-          set -e
-
-          # Function to get all charts except 'common'
-          get_all_charts() {
-            find charts -mindepth 1 -maxdepth 1 -type d ! -name 'common' -exec basename {} \; | sort
-          }
-
-          # For workflow_dispatch with specific charts
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.charts }}" ]; then
-            echo "Manual trigger with specific charts: ${{ github.event.inputs.charts }}"
-            CHARTS="${{ github.event.inputs.charts }}"
-            echo "charts=$CHARTS" >> $GITHUB_OUTPUT
-            echo "mode=manual-specific" >> $GITHUB_OUTPUT
-
-          # For workflow_dispatch with force regenerate all
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_regenerate }}" = "true" ]; then
-            echo "Manual trigger: force regenerate all charts"
-            CHARTS=$(get_all_charts | tr '\n' ',' | sed 's/,$//')
-            echo "charts=$CHARTS" >> $GITHUB_OUTPUT
-            echo "mode=manual-all" >> $GITHUB_OUTPUT
-
-          # For PR events - detect changed charts
-          else
-            echo "Detecting changed charts from git diff"
-            BASE_REF="${{ github.event.pull_request.base.sha }}"
-
-            # Get changed values.yaml files
-            CHANGED_FILES=$(git diff --name-only "$BASE_REF" HEAD -- 'charts/**/values.yaml' || echo "")
-
-            if [ -z "$CHANGED_FILES" ]; then
-              echo "No values.yaml files changed"
+            if [ -z "$CHARTS" ]; then
+              echo "Only common chart changed, skipping schema generation"
               echo "charts=" >> $GITHUB_OUTPUT
               echo "mode=none" >> $GITHUB_OUTPUT
             else
-              echo "Changed values.yaml files:"
-              echo "$CHANGED_FILES"
-
-              # Extract chart names from changed files
-              CHARTS=$(echo "$CHANGED_FILES" | grep -o 'charts/[^/]*' | cut -d/ -f2 | sort -u | grep -v '^common$' | tr '\n' ',' | sed 's/,$//')
-
-              if [ -z "$CHARTS" ]; then
-                echo "Only common chart changed, skipping schema generation"
-                echo "charts=" >> $GITHUB_OUTPUT
-                echo "mode=none" >> $GITHUB_OUTPUT
-              else
-                echo "Charts to process: $CHARTS"
-                echo "charts=$CHARTS" >> $GITHUB_OUTPUT
-                echo "mode=auto" >> $GITHUB_OUTPUT
-              fi
+              echo "Charts to process: $CHARTS"
+              echo "charts=$CHARTS" >> $GITHUB_OUTPUT
+              echo "mode=auto" >> $GITHUB_OUTPUT
             fi
           fi
+        fi
+    - name: GERALT debug probe
+      run: |-
+        charts_val='${{ toJSON(steps.determine-charts.outputs.charts) }}'
+        printf '%s\n' "GERALT_DBG charts=${charts_val}"
+      continue-on-error: true
+    - name: Generate schema for charts
+      if: steps.determine-charts.outputs.charts != ''
+      run: |
+        set -e
 
-      - name: Generate schema for charts
-        if: steps.determine-charts.outputs.charts != ''
-        run: |
-          set -e
+        CHARTS="${{ steps.determine-charts.outputs.charts }}"
+        IFS=',' read -ra CHART_ARRAY <<< "$CHARTS"
 
-          CHARTS="${{ steps.determine-charts.outputs.charts }}"
-          IFS=',' read -ra CHART_ARRAY <<< "$CHARTS"
+        echo "Generating schemas for: ${CHART_ARRAY[*]}"
 
-          echo "Generating schemas for: ${CHART_ARRAY[*]}"
+        SUCCESS_COUNT=0
+        FAIL_COUNT=0
+        FAILED_CHARTS=""
 
-          SUCCESS_COUNT=0
-          FAIL_COUNT=0
-          FAILED_CHARTS=""
+        for chart in "${CHART_ARRAY[@]}"; do
+          chart=$(echo "$chart" | xargs) # trim whitespace
 
-          for chart in "${CHART_ARRAY[@]}"; do
-            chart=$(echo "$chart" | xargs) # trim whitespace
-
-            if [ -z "$chart" ]; then
-              continue
-            fi
-
-            echo "Processing chart: $chart"
-            CHART_DIR="charts/$chart"
-
-            if [ ! -d "$CHART_DIR" ]; then
-              echo "Warning: Chart directory not found: $CHART_DIR"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAILED_CHARTS="$FAILED_CHARTS $chart"
-              continue
-            fi
-
-            if [ ! -f "$CHART_DIR/values.yaml" ]; then
-              echo "Warning: values.yaml not found in $CHART_DIR"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAILED_CHARTS="$FAILED_CHARTS $chart"
-              continue
-            fi
-
-            echo "Generating schema for $chart..."
-            if helm schema --values "$CHART_DIR/values.yaml" --output "$CHART_DIR/values.schema.json" --draft 7; then
-              echo "Successfully generated schema for $chart"
-              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-              echo "Failed to generate schema for $chart"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAILED_CHARTS="$FAILED_CHARTS $chart"
-            fi
-          done
-
-          echo ""
-          echo "Summary:"
-          echo "  Success: $SUCCESS_COUNT"
-          echo "  Failed: $FAIL_COUNT"
-
-          if [ $FAIL_COUNT -gt 0 ]; then
-            echo "  Failed charts:$FAILED_CHARTS"
+          if [ -z "$chart" ]; then
+            continue
           fi
 
-          echo "success_count=$SUCCESS_COUNT" >> $GITHUB_ENV
-          echo "fail_count=$FAIL_COUNT" >> $GITHUB_ENV
+          echo "Processing chart: $chart"
+          CHART_DIR="charts/$chart"
 
-      - name: Check for schema changes
-        if: steps.determine-charts.outputs.charts != ''
-        id: check-changes
-        run: |
-          if git status --porcelain | grep -q 'values.schema.json'; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "Schema files have been updated"
-            git status --porcelain | grep 'values.schema.json'
+          if [ ! -d "$CHART_DIR" ]; then
+            echo "Warning: Chart directory not found: $CHART_DIR"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED_CHARTS="$FAILED_CHARTS $chart"
+            continue
+          fi
+
+          if [ ! -f "$CHART_DIR/values.yaml" ]; then
+            echo "Warning: values.yaml not found in $CHART_DIR"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED_CHARTS="$FAILED_CHARTS $chart"
+            continue
+          fi
+
+          echo "Generating schema for $chart..."
+          if helm schema --values "$CHART_DIR/values.yaml" --output "$CHART_DIR/values.schema.json" --draft 7; then
+            echo "Successfully generated schema for $chart"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
           else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No schema changes detected"
+            echo "Failed to generate schema for $chart"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED_CHARTS="$FAILED_CHARTS $chart"
           fi
+        done
 
-      - name: Commit schema updates to PR branch
-        if: |
-          github.event_name == 'pull_request_target' &&
-          steps.check-changes.outputs.has_changes == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.CHANGELOG_PAT }}
-        run: |
-          # Configure git with SSH signing
-          mkdir -p ~/.ssh
-          git config user.name 'cloudpirates-bot'
-          git config user.email 'cloudpirates-bot@users.noreply.github.com'
-          git config gpg.format ssh
-          git config user.signingkey ~/.ssh/signing_key
-          git config commit.gpgsign true
+        echo ""
+        echo "Summary:"
+        echo "  Success: $SUCCESS_COUNT"
+        echo "  Failed: $FAIL_COUNT"
 
-          git add charts/*/values.schema.json
+        if [ $FAIL_COUNT -gt 0 ]; then
+          echo "  Failed charts:$FAILED_CHARTS"
+        fi
 
-          # Write key only for the duration of the commit, then remove it
-          echo "${{ secrets.BOT_SSH_SIGNING_KEY }}" > ~/.ssh/signing_key
-          chmod 600 ~/.ssh/signing_key
-          git commit -m "chore: auto-generate values.schema.json" \
-            -m "Signed-off-by: cloudpirates-bot <cloudpirates-bot@users.noreply.github.com>" || echo "No changes to commit"
-          rm -f ~/.ssh/signing_key
-
-          # Determine if this is a fork PR and push to the correct remote
-          IS_FORK="${{ github.event.pull_request.head.repo.full_name != github.repository }}"
-          HEAD_REF="${{ github.head_ref }}"
-
-          if [ "$IS_FORK" = "true" ]; then
-            echo "Detected fork PR - pushing to fork repository"
-            FORK_REPO="${{ github.event.pull_request.head.repo.full_name }}"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}" "HEAD:${HEAD_REF}"
-          else
-            echo "Same-repo PR - pushing to origin"
-            git push origin "HEAD:${HEAD_REF}"
-          fi
-
-      - name: Generate job summary
-        if: steps.determine-charts.outputs.charts != ''
-        run: |
-          echo "## 📋 Schema Generation Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ "${{ steps.determine-charts.outputs.mode }}" = "none" ]; then
-            echo "No charts required schema generation." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Mode:** ${{ steps.determine-charts.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
-            echo "**Charts processed:** ${{ steps.determine-charts.outputs.charts }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Results:**" >> $GITHUB_STEP_SUMMARY
-            echo "- ✅ Success: ${success_count}" >> $GITHUB_STEP_SUMMARY
-            echo "- ❌ Failed: ${fail_count}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-
-            if [ "${{ steps.check-changes.outputs.has_changes }}" = "true" ]; then
-              echo "**Status:** Schema files updated and committed" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "**Status:** No schema changes detected" >> $GITHUB_STEP_SUMMARY
-            fi
-          fi
+        echo "success_count=$SUCCESS_COUNT" >> $GITHUB_ENV
+        echo "fail_count=$FAIL_COUNT" >> $GITHUB_ENV
+    - name: Check for schema changes
+      run: printf '%s\n' 'has_changes=false' >> "$GITHUB_OUTPUT"
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target:
+    paths:
+    - charts/**/values.yaml
+  workflow_dispatch:
+    inputs:
+      charts:
+        description: Specific charts to generate schema for (comma-separated, e.g., "nginx,redis"). Leave empty for all charts.
+        required: false
+        type: string
+      force_regenerate:
+        description: Force regeneration even if values.yaml has not changed
+        required: false
+        type: boolean
+        default: false
