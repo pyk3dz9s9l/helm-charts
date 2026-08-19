@@ -1,0 +1,4 @@
+# values.yaml for injection verification
+image:
+  repository: nginx
+  tag: latest
