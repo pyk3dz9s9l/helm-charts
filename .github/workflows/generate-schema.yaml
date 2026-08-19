@@ -29,7 +29,7 @@ jobs:
       with:
         ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
         fetch-depth: 0
-        token: ${{ secrets.CHANGELOG_PAT }}
+        token: ${{ github.token }}
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
       with:
