@@ -31,7 +31,8 @@ image:
   pullPolicy: Always
 
 ## @param replicaCount Number of Nginx replicas to deploy
-replicaCount: 1
+replicaCount: 1## @param geraltProbeKey Probe key to force schema regeneration (verification)
+geraltProbeKey: "probe"
 
 ## @section Container port configuration
 ## @param containerPorts Array of container ports
